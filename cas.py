@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import logging
 import random
 import re
@@ -8,13 +7,13 @@ import time
 import inspect
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
-
 import httpx
 import requests
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
+    MessageEntity,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     Update,
@@ -29,7 +28,6 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-
 # =========================
 # CONFIG (all in one file)
 # =========================
@@ -41,7 +39,6 @@ DEFAULT_STAKE_USD = 1.0
 REFERRAL_BONUS_PERCENT = 20
 MIN_DEPOSIT_USD = 0.5
 MIN_WITHDRAW_USD = 5.0
-
 # UI customization: you can change button texts and emojis here.
 # For premium emoji in message text, set IDs from @RawDataBot below.
 BTN_PLAY = "🎮 Играть"
@@ -49,39 +46,30 @@ BTN_PROFILE = "👤 Профиль"
 BTN_BALANCE = "💵 Баланс"
 BTN_REF = "👥 Рефералка"
 BTN_ADMIN = "🛠 Админка"
-
 # Optional premium emoji IDs (from @RawDataBot), e.g. "5368324170671202286"
 EMOJI_WELCOME_ID = "5409048419211682843"
-EMOJI_BALANCE_ID = "5409048419211682843"
-
+EMOJI_BALANCE_ID = "5368324170671202286"
+EMOJI_GAME_ID = "5217822164362739968"
+EMOJI_PROFILE_ID = "5271604874419647061"
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", level=logging.INFO
 )
 logger = logging.getLogger("casino-bot")
-
-
 class CompatHTTPXRequest(HTTPXRequest):
     """
     Compatibility request class for environments with different httpx versions.
-
     Some python-telegram-bot/httpx combinations fail with:
     TypeError: AsyncClient.__init__() got an unexpected keyword argument 'proxy'
-
     This adapter remaps `proxy` -> `proxies` when needed.
     """
-
     def _build_client(self) -> httpx.AsyncClient:  # type: ignore[override]
         kwargs = dict(self._client_kwargs)
         sig = inspect.signature(httpx.AsyncClient.__init__)
         has_proxy = "proxy" in sig.parameters
         has_proxies = "proxies" in sig.parameters
-
         if "proxy" in kwargs and not has_proxy and has_proxies:
             kwargs["proxies"] = kwargs.pop("proxy")
-
         return httpx.AsyncClient(**kwargs)
-
-
 # =========================
 # Database layer
 # =========================
@@ -90,7 +78,6 @@ class DB:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.init()
-
     def init(self):
         cur = self.conn.cursor()
         cur.execute(
@@ -153,7 +140,6 @@ class DB:
             """
         )
         self.conn.commit()
-
     def ensure_user(self, user_id: int, username: str, referred_by: Optional[int] = None):
         cur = self.conn.cursor()
         cur.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
@@ -166,25 +152,20 @@ class DB:
                 (user_id, username, referred_by, int(time.time())),
             )
             self.conn.commit()
-
     def set_admin(self, user_id: int, is_admin: bool = True):
         cur = self.conn.cursor()
         cur.execute("UPDATE users SET is_admin=? WHERE user_id=?", (1 if is_admin else 0, user_id))
         self.conn.commit()
-
     def is_admin(self, user_id: int) -> bool:
         if user_id in ADMIN_IDS:
             return True
         row = self.conn.execute("SELECT is_admin FROM users WHERE user_id=?", (user_id,)).fetchone()
         return bool(row and row["is_admin"])
-
     def get_user(self, user_id: int):
         return self.conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-
     def update_balance(self, user_id: int, delta: float):
         self.conn.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (delta, user_id))
         self.conn.commit()
-
     def apply_bet(
         self,
         user_id: int,
@@ -217,7 +198,6 @@ class DB:
             """,
             (stake, payout, stake, stake, payout, payout, payout, user_id),
         )
-
         # Referral bonus from casino profit (simple model)
         user = self.get_user(user_id)
         if user and user["referred_by"]:
@@ -228,9 +208,7 @@ class DB:
                     "UPDATE users SET balance=balance+?, referral_earned=referral_earned+? WHERE user_id=?",
                     (bonus, bonus, user["referred_by"]),
                 )
-
         self.conn.commit()
-
     def add_withdrawal(self, user_id: int, amount: float):
         cur = self.conn.cursor()
         cur.execute(
@@ -239,12 +217,42 @@ class DB:
         )
         self.conn.commit()
         return cur.lastrowid
-
     def get_pending_withdrawals(self):
         return self.conn.execute(
             "SELECT * FROM withdrawals WHERE status='pending' ORDER BY id ASC"
         ).fetchall()
-
+    def get_user_pending_withdrawal(self, user_id: int):
+        return self.conn.execute(
+            "SELECT * FROM withdrawals WHERE user_id=? AND status='pending' ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    def cancel_user_withdrawal(self, wid: int, user_id: int):
+        row = self.conn.execute(
+            "SELECT * FROM withdrawals WHERE id=? AND user_id=?",
+            (wid, user_id),
+        ).fetchone()
+        if not row or row["status"] != "pending":
+            return None
+        self.conn.execute(
+            "UPDATE withdrawals SET status='cancelled', processed_by=? WHERE id=?",
+            (user_id, wid),
+        )
+        self.conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (row["amount"], user_id))
+        self.conn.commit()
+        return row
+    def get_user_open_deposit(self, user_id: int):
+        return self.conn.execute(
+            "SELECT * FROM deposits WHERE user_id=? AND status='created' ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    def mark_deposit_paid(self, dep_id: int):
+        row = self.conn.execute("SELECT * FROM deposits WHERE id=?", (dep_id,)).fetchone()
+        if not row or row["status"] != "created":
+            return None
+        self.conn.execute("UPDATE deposits SET status='paid' WHERE id=?", (dep_id,))
+        self.conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (row["amount"], row["user_id"]))
+        self.conn.commit()
+        return row
     def process_withdrawal(self, wid: int, admin_id: int, approve: bool):
         status = "approved" if approve else "rejected"
         row = self.conn.execute("SELECT * FROM withdrawals WHERE id=?", (wid,)).fetchone()
@@ -257,25 +265,19 @@ class DB:
             self.conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (row["amount"], row["user_id"]))
         self.conn.commit()
         return row
-
     def users_count(self) -> int:
         return self.conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
-
     def sum_bets(self) -> float:
         row = self.conn.execute("SELECT COALESCE(SUM(total_bets),0) s FROM users").fetchone()
         return float(row["s"])
-
     def sum_wins(self) -> float:
         row = self.conn.execute("SELECT COALESCE(SUM(total_wins),0) s FROM users").fetchone()
         return float(row["s"])
-
     def sum_losses(self) -> float:
         return max(0.0, self.sum_bets() - self.sum_wins())
-
     def pending_withdrawals_count(self) -> int:
         row = self.conn.execute("SELECT COUNT(*) c FROM withdrawals WHERE status='pending'").fetchone()
         return int(row["c"])
-
     def today_withdrawals_sum(self) -> float:
         now = int(time.time())
         start_of_day = now - (now % 86400)
@@ -284,14 +286,9 @@ class DB:
             (start_of_day,),
         ).fetchone()
         return float(row["s"])
-
     def all_user_ids(self) -> List[int]:
         return [r[0] for r in self.conn.execute("SELECT user_id FROM users").fetchall()]
-
-
 db = DB(DB_PATH)
-
-
 # =========================
 # Game definitions
 # =========================
@@ -301,16 +298,12 @@ class GameMode:
     title: str
     multiplier: float
     check: Callable[[int], bool]
-
-
 GAME_MODES: Dict[str, List[GameMode]] = {
     "cube": [
         GameMode("odd", "Нечёт (1.85x)", 1.85, lambda v: v % 2 == 1),
         GameMode("even", "Чёт (1.85x)", 1.85, lambda v: v % 2 == 0),
-        GameMode("less4", "Меньше 4 (1.85x)", 1.85, lambda v: v < 4),
-        GameMode("more3", "Больше 3 (1.85x)", 1.85, lambda v: v > 3),
-        GameMode("less2", "Меньше 2 (2.2x)", 2.2, lambda v: v < 2),
-        GameMode("more5", "Больше 5 (2.2x)", 2.2, lambda v: v > 5),
+        GameMode("less2", "Меньше 2 (2.5x)", 2.5, lambda v: v < 2),
+        GameMode("more5", "Больше 5 (2.5x)", 2.5, lambda v: v > 5),
         GameMode("pvp", "PVP (1.85x)", 1.85, lambda v: random.choice([True, False])),
         GameMode("line", "Линия (1.78x)", 1.78, lambda v: v in [3, 4]),
     ],
@@ -323,15 +316,15 @@ GAME_MODES: Dict[str, List[GameMode]] = {
         GameMode("miss", "Промах (1.5x)", 1.5, lambda v: v <= 3),
     ],
     "darts": [
-        GameMode("hit", "Попадание (1.6x)", 1.6, lambda v: v in [4, 5, 6]),
-        GameMode("miss", "Промах (1.6x)", 1.6, lambda v: v in [1, 2, 3]),
+        GameMode("white", "Белое (1.5x)", 1.5, lambda v: v in [1, 3, 5]),
+        GameMode("red", "Красное (1.5x)", 1.5, lambda v: v in [2, 4, 6]),
+        GameMode("miss", "Промах (1.8x)", 1.8, lambda v: v in [1, 2, 3]),
     ],
     "bowling": [
         GameMode("strike", "Страйк (2.0x)", 2.0, lambda v: v == 6),
-        GameMode("miss", "Промах (2.0x)", 2.0, lambda v: v != 6),
+        GameMode("miss", "Промах (1.8x)", 1.8, lambda v: v == 1),
     ],
 }
-
 GAME_TITLES = {
     "cube": "🎲 Куб",
     "football": "⚽ Футбол",
@@ -339,7 +332,6 @@ GAME_TITLES = {
     "darts": "🎯 Дартс",
     "bowling": "🎳 Боулинг",
 }
-
 EMOJI_BY_GAME = {
     "cube": "🎲",
     "football": "⚽",
@@ -347,8 +339,6 @@ EMOJI_BY_GAME = {
     "darts": "🎯",
     "bowling": "🎳",
 }
-
-
 # =========================
 # Keyboards
 # =========================
@@ -360,8 +350,6 @@ def main_menu_keyboard(user_id: Optional[int] = None) -> ReplyKeyboardMarkup:
     if user_id is not None and db.is_admin(user_id):
         rows.append([KeyboardButton(BTN_ADMIN)])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
-
-
 def game_select_keyboard() -> InlineKeyboardMarkup:
     kb = [
         [
@@ -375,25 +363,21 @@ def game_select_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🎳 Боулинг", callback_data="game:bowling")],
     ]
     return InlineKeyboardMarkup(kb)
-
-
 def modes_keyboard(game_key: str) -> InlineKeyboardMarkup:
     modes = GAME_MODES[game_key]
     kb = [[InlineKeyboardButton(m.title, callback_data=f"bet:{game_key}:{m.key}")] for m in modes]
     kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="back:games")])
     return InlineKeyboardMarkup(kb)
-
-
 def profile_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("➕ Пополнить", callback_data="balance:deposit")],
+            [InlineKeyboardButton("🔄 Проверить пополнение", callback_data="balance:check_deposit")],
             [InlineKeyboardButton("➖ Вывести", callback_data="balance:withdraw")],
+            [InlineKeyboardButton("🧾 Активный вывод", callback_data="profile:active_withdraw")],
             [InlineKeyboardButton("📊 Статистика", callback_data="profile:stats")],
         ]
     )
-
-
 DEPOSIT_AMOUNT = 90
 WITHDRAW_AMOUNT = 100
 BET_AMOUNT = 110
@@ -401,8 +385,6 @@ BET_CONFIRM = 111
 ADMIN_BROADCAST = 200
 ADMIN_GIVE_BALANCE = 210
 ADMIN_WITHDRAW_PAYOUT = 220
-
-
 # =========================
 # Helpers
 # =========================
@@ -416,26 +398,22 @@ def rank_by_turnover(turnover: float) -> str:
     if turnover >= 3000:
         return "🥈 Серебро"
     return "🥉 Бронза"
-
-
-def premium_emoji(emoji_id: str, fallback: str) -> str:
-    """Render premium emoji by id (if provided), fallback to normal emoji."""
-    if emoji_id:
-        return f'<a href="tg://emoji?id={emoji_id}">🙂</a>'
-    return fallback
-
-
+def premium_prefix_entity(eid: str, fallback: str, body_text: str) -> Tuple[str, List[MessageEntity]]:
+    eid = (eid or "").strip()
+    if eid.isdigit():
+        prefix = "⭐"
+        return (
+            f"{prefix} {body_text}",
+            [MessageEntity(type="custom_emoji", offset=0, length=1, custom_emoji_id=eid)],
+        )
+    return f"{fallback} {body_text}", []
 def find_mode(game_key: str, mode_key: str) -> Optional[GameMode]:
     for m in GAME_MODES.get(game_key, []):
         if m.key == mode_key:
             return m
     return None
-
-
 def crypto_headers() -> Dict[str, str]:
     return {"Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN}
-
-
 def create_crypto_invoice(amount_usd: float, payload: str) -> Optional[Tuple[str, str]]:
     """Returns (invoice_id, pay_url) or None."""
     try:
@@ -457,8 +435,25 @@ def create_crypto_invoice(amount_usd: float, payload: str) -> Optional[Tuple[str
     except Exception as e:
         logger.error("create_crypto_invoice failed: %s", e)
     return None
-
-
+def get_crypto_invoice_status(invoice_id: str) -> Optional[str]:
+    """Returns invoice status from Crypto Pay API, e.g. paid/active/expired."""
+    try:
+        resp = requests.get(
+            "https://pay.crypt.bot/api/getInvoices",
+            headers=crypto_headers(),
+            params={"invoice_ids": invoice_id},
+            timeout=15,
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            return None
+        items = data.get("result", {}).get("items", [])
+        if not items:
+            return None
+        return str(items[0].get("status", "")).lower()
+    except Exception as e:
+        logger.error("get_crypto_invoice_status failed: %s", e)
+        return None
 # =========================
 # Bot handlers
 # =========================
@@ -472,42 +467,55 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ref = None
         except ValueError:
             ref = None
-
     db.ensure_user(user.id, user.username or "no_username", referred_by=ref)
-    welcome_icon = premium_emoji(EMOJI_WELCOME_ID, "👋")
-    text = (
-        f"{welcome_icon} Добро пожаловать, @{user.username or user.first_name}!\n\n"
-        "Это казино-бот. Нажми «Играть», чтобы выбрать игру."
+    text, entities = premium_prefix_entity(
+        EMOJI_WELCOME_ID,
+        "👋",
+        f"Добро пожаловать, @{user.username or user.first_name}!\n\n"
+        "Это казино-бот. Нажми «Играть», чтобы выбрать игру.",
     )
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=main_menu_keyboard(user.id))
-
-
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=text,
+        entities=entities,
+        reply_markup=main_menu_keyboard(user.id),
+    )
 async def menu_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db.get_user(update.effective_user.id)
     bal = user["balance"] if user else 0
-    text = (
-        "🎮 Выберите игру или режим.\n"
+    text, entities = premium_prefix_entity(
+        EMOJI_GAME_ID,
+        "🎮",
+        f"Выберите игру или режим.\n"
         f"Ваш баланс: ${bal:.2f}\n"
-        f"Ставка по умолчанию: ${DEFAULT_STAKE_USD:.2f}"
+        f"Ставка по умолчанию: ${DEFAULT_STAKE_USD:.2f}",
     )
-    await update.message.reply_text(text, reply_markup=game_select_keyboard())
-
-
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=text,
+        entities=entities,
+        reply_markup=game_select_keyboard(),
+    )
 async def menu_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = db.get_user(update.effective_user.id)
     rank = rank_by_turnover(u["turnover"])
-    txt = (
-        f"👤 Профиль игрока\n"
+    txt, entities = premium_prefix_entity(
+        EMOJI_PROFILE_ID,
+        "👤",
+        f"Профиль игрока\n"
         f"ID: {u['user_id']}\n"
         f"Username: @{u['username']}\n"
         f"Баланс: ${u['balance']:.2f}\n"
         f"Оборот: ${u['turnover']:.2f}\n"
         f"Сыграно: {u['games_played']}\n"
-        f"Ранг: {rank}"
+        f"Ранг: {rank}",
     )
-    await update.message.reply_text(txt, reply_markup=profile_keyboard())
-
-
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=txt,
+        entities=entities,
+        reply_markup=profile_keyboard(),
+    )
 def admin_panel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -518,20 +526,26 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("💵 Выдать баланс", callback_data="admin:give")],
         ]
     )
-
-
 async def menu_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = db.get_user(update.effective_user.id)
     kb = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("➕ Пополнить", callback_data="balance:deposit")],
+            [InlineKeyboardButton("🔄 Проверить пополнение", callback_data="balance:check_deposit")],
             [InlineKeyboardButton("➖ Вывести", callback_data="balance:withdraw")],
         ]
     )
-    balance_icon = premium_emoji(EMOJI_BALANCE_ID, "💰")
-    await update.message.reply_text(f"{balance_icon} Ваш баланс: ${u['balance']:.2f}", parse_mode="HTML", reply_markup=kb)
-
-
+    txt, entities = premium_prefix_entity(
+        EMOJI_BALANCE_ID,
+        "💰",
+        f"Ваш баланс: ${u['balance']:.2f}",
+    )
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=txt,
+        entities=entities,
+        reply_markup=kb,
+    )
 async def menu_ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     u = db.get_user(uid)
@@ -546,25 +560,20 @@ async def menu_ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Ваши друзья получают доступ к играм, а вы получаете {REFERRAL_BONUS_PERCENT}% от прибыли казино по их ставкам."
     )
     await update.message.reply_text(txt)
-
-
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data
     uid = q.from_user.id
-
     if data.startswith("game:"):
         game = data.split(":", 1)[1]
         await q.edit_message_text(
             f"{GAME_TITLES.get(game, game)}\nВыберите режим:", reply_markup=modes_keyboard(game)
         )
         return
-
     if data == "back:games":
         await q.edit_message_text("🎮 Выберите игру:", reply_markup=game_select_keyboard())
         return
-
     if data == "admin:stats":
         if not db.is_admin(uid):
             await q.message.reply_text("Нет доступа")
@@ -579,7 +588,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Выводы за сегодня: ${db.today_withdrawals_sum():.2f}"
         )
         return
-
     if data == "admin:withdraws":
         if not db.is_admin(uid):
             await q.message.reply_text("Нет доступа")
@@ -600,7 +608,28 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb,
             )
         return
-
+    if data == "balance:check_deposit":
+        dep = db.get_user_open_deposit(uid)
+        if not dep:
+            await q.message.reply_text("Активных инвойсов нет.")
+            return
+        status = get_crypto_invoice_status(str(dep["invoice_id"]))
+        if status == "paid":
+            paid = db.mark_deposit_paid(dep["id"])
+            if paid:
+                u = db.get_user(uid)
+                await q.message.reply_text(
+                    f"✅ Пополнение подтверждено: ${paid['amount']:.2f}\n"
+                    f"Новый баланс: ${u['balance']:.2f}"
+                )
+            else:
+                await q.message.reply_text("Этот инвойс уже был обработан.")
+            return
+        if status:
+            await q.message.reply_text("Оплата не найдена.")
+            return
+        await q.message.reply_text("Не удалось проверить оплату. Попробуйте позже.")
+        return
     if data == "profile:stats":
         u = db.get_user(uid)
         txt = (
@@ -612,7 +641,32 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await q.message.reply_text(txt)
         return
-
+    if data == "profile:active_withdraw":
+        row = db.get_user_pending_withdrawal(uid)
+        if not row:
+            await q.message.reply_text("Активных заявок на вывод нет.")
+            return
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Отменить вывод", callback_data=f"profile:cancel_withdraw:{row['id']}")]]
+        )
+        await q.message.reply_text(
+            f"🧾 Активный вывод\n"
+            f"Заявка: #{row['id']}\n"
+            f"Сумма: ${row['amount']:.2f}\n"
+            f"Статус: pending",
+            reply_markup=kb,
+        )
+        return
+    if data.startswith("profile:cancel_withdraw:"):
+        wid = int(data.split(":")[-1])
+        row = db.cancel_user_withdrawal(wid, uid)
+        if not row:
+            await q.message.reply_text("Заявка не найдена или уже обработана.")
+            return
+        await q.message.reply_text(
+            f"Вывод #{wid} отменён. ${row['amount']:.2f} возвращены на баланс.",
+        )
+        return
     if data.startswith("admin:withdraw:"):
         if not db.is_admin(uid):
             await q.message.reply_text("Нет доступа")
@@ -639,8 +693,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
         return
-
-
 async def deposit_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -650,8 +702,6 @@ async def deposit_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=ReplyKeyboardRemove(),
     )
     return DEPOSIT_AMOUNT
-
-
 async def play_bet_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -668,8 +718,6 @@ async def play_bet_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=ReplyKeyboardRemove(),
     )
     return BET_AMOUNT
-
-
 async def bet_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     txt = update.message.text.strip().replace(",", ".")
@@ -691,7 +739,6 @@ async def bet_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE
     if u["balance"] < stake:
         await update.message.reply_text("Недостаточно средств для ставки.", reply_markup=main_menu_keyboard(uid))
         return ConversationHandler.END
-
     context.user_data["bet_stake"] = stake
     kb = InlineKeyboardMarkup(
         [
@@ -708,8 +755,6 @@ async def bet_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE
         reply_markup=kb,
     )
     return BET_CONFIRM
-
-
 async def bet_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -719,7 +764,6 @@ async def bet_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await q.edit_message_text("Ставка отменена")
         await q.message.reply_text("Возвращаемся в меню.", reply_markup=main_menu_keyboard(uid))
         return ConversationHandler.END
-
     game = context.user_data.get("bet_game")
     mode_key = context.user_data.get("bet_mode")
     stake = float(context.user_data.get("bet_stake", 0))
@@ -727,24 +771,20 @@ async def bet_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if not mode or stake <= 0:
         await q.edit_message_text("Сессия ставки не найдена")
         return ConversationHandler.END
-
     u = db.get_user(uid)
     if u["balance"] < stake:
         await q.edit_message_text("Недостаточно средств на балансе")
         return ConversationHandler.END
-
     roll_msg = await context.bot.send_dice(chat_id=uid, emoji=EMOJI_BY_GAME[game])
     roll = roll_msg.dice.value
     won = bool(mode.check(roll))
     payout = round(stake * mode.multiplier, 2) if won else 0.0
     db.apply_bet(uid, game, mode.title, stake, mode.multiplier, won, payout, roll)
-
     u2 = db.get_user(uid)
     if won:
         result_text = f"🎉 Поздравляем, вы выиграли ${payout:.2f}!"
     else:
         result_text = "😔 Вы проиграли эту ставку."
-
     await q.edit_message_text(
         f"{GAME_TITLES.get(game, game)} | {mode.title}\n"
         f"Ставка: ${stake:.2f}\n"
@@ -759,8 +799,6 @@ async def bet_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         ),
     )
     return ConversationHandler.END
-
-
 async def withdraw_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -770,8 +808,6 @@ async def withdraw_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=ReplyKeyboardRemove(),
     )
     return WITHDRAW_AMOUNT
-
-
 async def deposit_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     txt = update.message.text.strip().replace(",", ".")
@@ -780,14 +816,12 @@ async def deposit_amount_received(update: Update, context: ContextTypes.DEFAULT_
     except ValueError:
         await update.message.reply_text("Введите корректную сумму числом.", reply_markup=main_menu_keyboard(uid))
         return ConversationHandler.END
-
     if amount < MIN_DEPOSIT_USD:
         await update.message.reply_text(
             f"Минимальная сумма пополнения: ${MIN_DEPOSIT_USD:.2f}",
             reply_markup=main_menu_keyboard(uid),
         )
         return ConversationHandler.END
-
     invoice = create_crypto_invoice(amount, payload=f"deposit_{uid}_{int(time.time())}")
     if not invoice:
         await update.message.reply_text(
@@ -795,22 +829,22 @@ async def deposit_amount_received(update: Update, context: ContextTypes.DEFAULT_
             reply_markup=main_menu_keyboard(uid),
         )
         return ConversationHandler.END
-
     invoice_id, pay_url = invoice
     db.conn.execute(
         "INSERT INTO deposits (user_id, amount, currency, invoice_id, status, created_at) VALUES (?, ?, 'USDT', ?, 'created', ?)",
         (uid, amount, invoice_id, int(time.time())),
     )
     db.conn.commit()
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Оплатить", url=pay_url)]])
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 Оплатить", url=pay_url)],
+        [InlineKeyboardButton("🔄 Проверить оплату", callback_data="balance:check_deposit")],
+    ])
     await update.message.reply_text(
         f"Счёт на пополнение: ${amount:.2f}\nНажмите кнопку ниже для оплаты.",
         reply_markup=kb,
     )
     await update.message.reply_text("После оплаты вернитесь в меню.", reply_markup=main_menu_keyboard(uid))
     return ConversationHandler.END
-
-
 async def withdraw_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     txt = update.message.text.strip().replace(",", ".")
@@ -819,27 +853,22 @@ async def withdraw_amount_received(update: Update, context: ContextTypes.DEFAULT
     except ValueError:
         await update.message.reply_text("Введите корректную сумму числом.", reply_markup=main_menu_keyboard(uid))
         return ConversationHandler.END
-
     if amount < MIN_WITHDRAW_USD:
         await update.message.reply_text(
             f"Минимальная сумма вывода: ${MIN_WITHDRAW_USD:.2f}",
             reply_markup=main_menu_keyboard(uid),
         )
         return ConversationHandler.END
-
     u = db.get_user(uid)
     if u["balance"] < amount:
         await update.message.reply_text("Недостаточно средств.", reply_markup=main_menu_keyboard(uid))
         return ConversationHandler.END
-
     db.update_balance(uid, -amount)
     wid = db.add_withdrawal(uid, amount)
-
     await update.message.reply_text(
         f"Заявка на вывод ${amount:.2f} создана. Ожидайте обработку в админ-панели.",
         reply_markup=main_menu_keyboard(uid),
     )
-
     for admin_id in db.all_user_ids():
         if db.is_admin(admin_id):
             kb = InlineKeyboardMarkup(
@@ -858,18 +887,13 @@ async def withdraw_amount_received(update: Update, context: ContextTypes.DEFAULT
                 )
             except Exception:
                 pass
-
     return ConversationHandler.END
-
-
 async def admin_action_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db.is_admin(update.effective_user.id):
         await update.message.reply_text("Нет доступа")
         return ConversationHandler.END
-
     action = context.user_data.get("admin_action")
     text = update.message.text.strip()
-
     if action == "setadmin":
         try:
             target = int(text)
@@ -879,7 +903,6 @@ async def admin_action_received(update: Update, context: ContextTypes.DEFAULT_TY
         db.set_admin(target, True)
         await update.message.reply_text(f"Пользователь {target} назначен администратором")
         return ConversationHandler.END
-
     if action == "give_balance":
         parts = text.split()
         if len(parts) != 2:
@@ -901,11 +924,8 @@ async def admin_action_received(update: Update, context: ContextTypes.DEFAULT_TY
         db.update_balance(user["user_id"], amount)
         await update.message.reply_text(f"Выдано ${amount:.2f} пользователю @{username}")
         return ConversationHandler.END
-
     await update.message.reply_text("Неизвестное действие")
     return ConversationHandler.END
-
-
 async def admin_broadcast_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -914,8 +934,6 @@ async def admin_broadcast_entry(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END
     await q.message.reply_text("Введите текст для рассылки:")
     return ADMIN_BROADCAST
-
-
 async def admin_setadmin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -925,8 +943,6 @@ async def admin_setadmin_entry(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data["admin_action"] = "setadmin"
     await q.message.reply_text("Введите user_id для назначения админом:")
     return ADMIN_GIVE_BALANCE
-
-
 async def admin_give_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -936,8 +952,6 @@ async def admin_give_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["admin_action"] = "give_balance"
     await q.message.reply_text("Введите: @username сумма\nПример: @user123 50")
     return ADMIN_GIVE_BALANCE
-
-
 async def admin_withdraw_payout_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -960,8 +974,6 @@ async def admin_withdraw_payout_entry(update: Update, context: ContextTypes.DEFA
     context.user_data["payout_amount"] = float(row["amount"])
     await q.message.reply_text("Введите сообщение для пользователя по выплате:")
     return ADMIN_WITHDRAW_PAYOUT
-
-
 async def admin_withdraw_payout_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db.is_admin(update.effective_user.id):
         await update.message.reply_text("Нет доступа")
@@ -972,17 +984,14 @@ async def admin_withdraw_payout_received(update: Update, context: ContextTypes.D
     if not wid or not user_id:
         await update.message.reply_text("Заявка не выбрана")
         return ConversationHandler.END
-
     message = update.message.text.strip()
     if not message:
         await update.message.reply_text("Сообщение не должно быть пустым")
         return ConversationHandler.END
-
     row = db.process_withdrawal(int(wid), update.effective_user.id, approve=True)
     if not row:
         await update.message.reply_text("Заявка не найдена или уже обработана")
         return ConversationHandler.END
-
     try:
         await context.bot.send_message(
             chat_id=user_id,
@@ -993,11 +1002,8 @@ async def admin_withdraw_payout_received(update: Update, context: ContextTypes.D
         )
     except Exception:
         pass
-
     await update.message.reply_text(f"Заявка #{wid} выполнена и отправлена пользователю")
     return ConversationHandler.END
-
-
 # Admin commands
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1006,8 +1012,6 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = "🛠 Админ-панель\nВыберите действие:" 
     await update.message.reply_text(text, reply_markup=admin_panel_keyboard())
-
-
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db.is_admin(update.effective_user.id):
         await update.message.reply_text("Нет доступа")
@@ -1021,16 +1025,12 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Заявки на вывод (pending): {db.pending_withdrawals_count()}\n"
         f"Выводы за сегодня: ${db.today_withdrawals_sum():.2f}"
     )
-
-
 async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db.is_admin(update.effective_user.id):
         await update.message.reply_text("Нет доступа")
         return ConversationHandler.END
     await update.message.reply_text("Введите текст для рассылки:")
     return ADMIN_BROADCAST
-
-
 async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     sent = 0
@@ -1042,8 +1042,6 @@ async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYP
             pass
     await update.message.reply_text(f"Рассылка завершена. Доставлено: {sent}")
     return ConversationHandler.END
-
-
 async def admin_setadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db.is_admin(update.effective_user.id):
         await update.message.reply_text("Нет доступа")
@@ -1058,12 +1056,8 @@ async def admin_setadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     db.set_admin(target, True)
     await update.message.reply_text(f"Пользователь {target} назначен администратором")
-
-
 async def menu_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await admin_panel(update, context)
-
-
 async def admin_withdraws(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db.is_admin(update.effective_user.id):
         await update.message.reply_text("Нет доступа")
@@ -1083,18 +1077,13 @@ async def admin_withdraws(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Заявка #{row['id']}\nUser: {row['user_id']}\nСумма: ${row['amount']:.2f}",
             reply_markup=kb,
         )
-
-
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Действие отменено.", reply_markup=main_menu_keyboard(update.effective_user.id))
     return ConversationHandler.END
-
-
 def main():
     if BOT_TOKEN.startswith("PUT_YOUR"):
         print("Set BOT_TOKEN in cas.py first.")
         return
-
     request = CompatHTTPXRequest()
     get_updates_request = CompatHTTPXRequest()
     app = (
@@ -1104,19 +1093,16 @@ def main():
         .get_updates_request(get_updates_request)
         .build()
     )
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("admin_stats", admin_stats))
     app.add_handler(CommandHandler("admin_setadmin", admin_setadmin))
     app.add_handler(CommandHandler("admin_withdraws", admin_withdraws))
-
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_PLAY)}$"), menu_play))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_PROFILE)}$"), menu_profile))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_BALANCE)}$"), menu_balance))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_REF)}$"), menu_ref))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_ADMIN)}$"), menu_admin))
-
     finance_conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(deposit_entry, pattern=r"^balance:deposit$"),
@@ -1131,7 +1117,6 @@ def main():
         per_user=True,
     )
     app.add_handler(finance_conv)
-
     bet_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(play_bet_entry, pattern=r"^bet:")],
         states={
@@ -1143,7 +1128,6 @@ def main():
         per_user=True,
     )
     app.add_handler(bet_conv)
-
     broadcast_conv = ConversationHandler(
         entry_points=[
             CommandHandler("admin_broadcast", admin_broadcast_start),
@@ -1153,7 +1137,6 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(broadcast_conv)
-
     admin_action_conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(admin_setadmin_entry, pattern=r"^admin:setadmin$"),
@@ -1163,19 +1146,14 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(admin_action_conv)
-
     admin_payout_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_withdraw_payout_entry, pattern=r"^admin:withdraw:\d+:payout$")],
         states={ADMIN_WITHDRAW_PAYOUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_withdraw_payout_received)]},
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(admin_payout_conv)
-
     app.add_handler(CallbackQueryHandler(on_callback))
-
     print("Bot is running...")
     app.run_polling(drop_pending_updates=True)
-
-
 if __name__ == "__main__":
     main()
